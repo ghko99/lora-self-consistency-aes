@@ -14,7 +14,7 @@
 2. **복합 손실 함수 (Composite Loss)**
 * **CE (Cross-Entropy):** 기본적인 언어 모델링 학습.
 * **NTL (Number Token Loss):** 숫자 토큰의 기댓값(Expectation)을 계산하여 정답 점수와의 오차를 최소화합니다 (MSE / Wasserstein).
-* **EMO (Embedding-based Metric-Oriented Loss):** 모델이 예측한 Top-K 토큰들의 임베딩 가중 평균과 정답 임베딩 간의 코사인 유사도를 학습에 반영합니다.
+* **EMO (Earth Mover's distance Optimization Loss):** 모델이 예측한 Top-K 토큰들의 임베딩 가중 평균과 정답 임베딩 간의 코사인 유사도를 학습에 반영합니다.
 
 
 3. **멀티 태스크 학습 (Multi-Task Learning, MTL)**
