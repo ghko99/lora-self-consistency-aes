@@ -1,6 +1,6 @@
 # LLaMA-AES: Advanced Automated Essay Scoring with Dynamic Loss Weighting
 
-본 프로젝트는 **LLaMA-3.1** 모델을 기반으로 자동 에세이 채점(AES) 성능을 극대화하기 위해 개발되었습니다. 단순한 Cross-Entropy Loss를 넘어, 점수 예측의 정교함을 높이는 **NTL(Number Token Loss)**과 의미적 유사도를 반영하는 **EMO(Embedding-based Metric-Oriented Loss)**를 결합하여 학습합니다.
+본 프로젝트는 **LLaMA-3.1** 모델을 기반으로 자동 에세이 채점(AES) 성능을 극대화하기 위해 개발되었습니다. 단순한 Cross-Entropy Loss를 넘어, 점수 예측의 정교함을 높이는 NTL(Number Token Loss)과 의미적 유사도를 반영하는 EMO(Embedding-based Metric-Oriented Loss)를 결합하여 학습합니다.
 
 특히, 학습 과정에서 손실 함수 간의 스케일 차이를 자동으로 보정하는 **Dynamic Loss Weighting** 기법을 적용하여 최적의 성능을 달성했습니다.
 
