@@ -1,0 +1,19 @@
+# Environments
+.venv
+venv/
+aes_env/
+.env
+
+# Cache
+__pycache__/
+*.pyc
+
+# Build & Temp
+.DS_Store
+*.tmp
+
+# Results & Logs
+runs/
+consistency_results/
+wandb/
+*.log
