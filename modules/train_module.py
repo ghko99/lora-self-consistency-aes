@@ -1,4 +1,4 @@
-import os, random, numpy as np, torch, datetime, re
+import os, random, json, numpy as np, torch, datetime, re
 import wandb
 from transformers import AutoModelForCausalLM, TrainingArguments, BitsAndBytesConfig, EarlyStoppingCallback
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -25,21 +25,54 @@ def set_seed(seed=42):
 def sanitize_name(name: str) -> str:
     return re.sub(r'[^A-Za-z0-9_\-]', '_', name)
 
-def make_unique_output_dir(baseline: bool, ratio: float, ntl_weight: float, emo_weight: float, loss_type: str, is_mtl: bool) -> str:
-    tag = "baseline" if baseline else f"ntl_{ntl_weight}_emo_{emo_weight}"
+def make_unique_output_dir(use_ntl: bool, use_emo: bool, use_cbfl: bool, ratio: float, loss_type: str, is_mtl: bool) -> str:
+    parts = ["ce"]
+    if use_ntl: parts.append("ntl")
+    if use_emo: parts.append("emo")
+    if use_cbfl: parts.append("cbfl")
+    tag = "+".join(parts)
     ratio_tag = f"ratio_{ratio}"
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     dir_name = f"./runs/{sanitize_name(tag)}_{sanitize_name(ratio_tag)}{('_mtl' if is_mtl else '')}_{timestamp}_{loss_type}"
     os.makedirs(dir_name, exist_ok=True)
-    
+
     return dir_name
 
-def init_wandb(baseline: bool, ratio: float, ntl_weight: float, emo_weight: float, output_dir: str, is_mtl: bool, no_wandb: bool = False):
+
+def compute_score_distribution(data_path: str) -> torch.Tensor:
+    """Parse training data to count occurrences of each score (1-9).
+
+    Returns:
+        Tensor of shape [9] with counts for scores 1-9.
+    """
+    counts = torch.zeros(9, dtype=torch.float32)
+    with open(data_path, "r", encoding="utf-8") as f:
+        for line in f:
+            item = json.loads(line)
+            output = item.get("output", "")
+            # First line of output contains space-separated scores
+            first_line = output.strip().split("\n")[0].strip()
+            for token in first_line.split():
+                try:
+                    score = int(token)
+                    if 1 <= score <= 9:
+                        counts[score - 1] += 1
+                except ValueError:
+                    continue
+    return counts
+
+def init_wandb(use_ntl: bool, use_emo: bool, use_cbfl: bool, ratio: float, output_dir: str, is_mtl: bool, no_wandb: bool = False):
     if no_wandb:
         return
 
-    project_name = sanitize_name(f"2026-02-07-llama_aes_mtl_full_{'baseline' if baseline else 'NTL'}")
-    run_name = sanitize_name(f"{'baseline' if baseline else f'ntl_{ntl_weight}'}_emo_{emo_weight}_r{ratio}{'_mtl' if is_mtl else ''}_{datetime.datetime.now().strftime('%m%d_%H%M')}")
+    parts = ["ce"]
+    if use_ntl: parts.append("ntl")
+    if use_emo: parts.append("emo")
+    if use_cbfl: parts.append("cbfl")
+    loss_tag = "+".join(parts)
+
+    project_name = sanitize_name(f"2026-02-07-llama_aes_mtl_full_{loss_tag}")
+    run_name = sanitize_name(f"{loss_tag}_r{ratio}{'_mtl' if is_mtl else ''}_{datetime.datetime.now().strftime('%m%d_%H%M')}")
     os.environ["WANDB_PROJECT"] = project_name
     os.environ["WANDB_RUN_NAME"] = run_name
     wandb.init(project=project_name, name=run_name, dir=output_dir, reinit=True)
@@ -55,31 +88,35 @@ def sample_ratio(dataset, ratio):
 # -------------------------------------------------
 # Train function
 # -------------------------------------------------
-def train_model(baseline: bool = False, 
-                ntl_weight: float = 2.0, 
-                emo_weight: float = 0.1, 
-                ratio: float = 1.0, 
-                loss_type: str = "mse", 
-                is_mtl: bool = False, 
+def train_model(use_ntl: bool = False,
+                use_emo: bool = False,
+                use_cbfl: bool = False,
+                ratio: float = 1.0,
+                loss_type: str = "mse",
+                is_mtl: bool = False,
                 resume_checkpoint: str = None,
                 no_wandb: bool = False,
                 base_model_name: str = None,
                 dry_run: bool = False):
+    # NTL/EMO는 항상 dynamic 모드(-1), on/off 플래그로만 제어
+    ntl_weight = -1 if use_ntl else 0
+    emo_weight = -1 if use_emo else 0
+    cb_weight  = 1.0 if use_cbfl else 0.0
+    cb_beta    = 0.9999
+    cb_gamma   = 2.0
+
     set_seed(42)
     model_name = os.path.expanduser(base_model_name)
 
     ckpt_to_resume = None
     if resume_checkpoint is not None:
-        # ✅ run 폴더를 그대로 output_dir로 사용
         output_dir = resume_checkpoint
-
-        # ✅ 그 안에서 가장 최신 checkpoint-xxxx 자동 탐색
         ckpt_to_resume = get_last_checkpoint(output_dir)
         if ckpt_to_resume is None:
             raise ValueError(f"No checkpoint found under: {output_dir}")
     else:
-        output_dir = make_unique_output_dir(baseline, ratio, ntl_weight, emo_weight, loss_type, is_mtl)
-    
+        output_dir = make_unique_output_dir(use_ntl, use_emo, use_cbfl, ratio, loss_type, is_mtl)
+
     if is_mtl:
         max_seq_length = 2048
     else:
@@ -87,7 +124,7 @@ def train_model(baseline: bool = False,
 
     use_bf16 = torch.cuda.is_bf16_supported()
 
-    init_wandb(baseline, ratio, ntl_weight, emo_weight, output_dir, is_mtl, no_wandb=no_wandb)
+    init_wandb(use_ntl, use_emo, use_cbfl, ratio, output_dir, is_mtl, no_wandb=no_wandb)
 
     # Dataset load (train, valid, test 동일한 비율)
     if is_mtl:
@@ -130,6 +167,7 @@ def train_model(baseline: bool = False,
         per_device_train_batch_size=4,
         per_device_eval_batch_size=4,
         gradient_accumulation_steps=8,
+        gradient_checkpointing=True,
         logging_steps=10,
         num_train_epochs=10,
         eval_strategy="epoch",
@@ -146,6 +184,13 @@ def train_model(baseline: bool = False,
     )
 
 
+    # Compute score distribution for CBFL
+    class_counts = None
+    if use_cbfl:
+        train_data_path = "./aes_dataset_mtl/train.jsonl" if is_mtl else "./aes_dataset/train.jsonl"
+        class_counts = compute_score_distribution(train_data_path)
+        print(f"Score distribution (1-9): {class_counts.tolist()}")
+
     trainer = CustomTrainer(
         model=model,
         args=trainer_args,
@@ -157,6 +202,10 @@ def train_model(baseline: bool = False,
         ntl_weight=ntl_weight,
         emo_weight=emo_weight,
         loss_type=loss_type,
+        cb_weight=cb_weight,
+        cb_beta=cb_beta,
+        cb_gamma=cb_gamma,
+        class_counts=class_counts,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
 

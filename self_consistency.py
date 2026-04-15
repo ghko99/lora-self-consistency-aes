@@ -80,12 +80,34 @@ def extract_digits_0_9(s: str, limit: int | None = None) -> List[int]:
     return out[:limit] if limit is not None else out
 
 
+def normalize_example(ex: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    지원 스키마:
+      1) {"instruction": str, "output": str}   (기본)
+      2) {"system": str, "user": str, "assistant": str}  (chat 포맷 fallback)
+    반환: (instruction, output)
+    """
+    instr = ex.get("instruction")
+    out = ex.get("output")
+    if instr and out:
+        return instr, out
+
+    sys_msg = ex.get("system", "") or ""
+    usr_msg = ex.get("user", "") or ""
+    asst_msg = ex.get("assistant", "") or ""
+    if (usr_msg or sys_msg) and asst_msg:
+        instr_fb = (sys_msg + "\n" + usr_msg).strip() if sys_msg else usr_msg
+        return instr_fb, asst_msg
+
+    raise ValueError(f"[SCHEMA ERROR] cannot find (instruction,output) or (system/user,assistant) in keys={list(ex.keys())}")
+
+
 def load_ground_truth_labels(test_jsonl_path: str) -> np.ndarray:
     """테스트 데이터셋 정답 라벨 로드."""
     ds = load_dataset("json", data_files=test_jsonl_path)["train"]
     labels = []
     for i, ex in enumerate(ds):
-        gt = ex.get("output", "")
+        _, gt = normalize_example(ex)
         gt_nums = extract_digits_0_9(gt, limit=8)
         if len(gt_nums) != 8:
             raise ValueError(f"[GT FORMAT ERROR] idx={i} output={repr(gt)} -> {gt_nums}")
@@ -365,8 +387,7 @@ def collect_samples_once(
     sample_bank: List[List[Optional[List[int]]]] = []
 
     for idx, ex in enumerate(tqdm(test_ds, desc=f"Collecting {max_m} samples")):
-        instruction = ex.get("instruction", "")
-        gt = ex.get("output", "")
+        instruction, gt = normalize_example(ex)
         gt_digits = extract_digits_0_9(gt, limit=8)
         if len(gt_digits) != 8:
             raise ValueError(f"[GT FORMAT ERROR] idx={idx} output={repr(gt)} -> digits={gt_digits}")

@@ -2,8 +2,10 @@ from transformers import Trainer
 from typing import Any
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from .wasserstein_number_token_loss import WassersteinNumberTokenLoss
 from .number_token_loss import NumberTokenLoss
+from .class_balanced_focal_loss import ClassBalancedFocalLoss
 
 class CustomTrainer(Trainer):
     def __init__(
@@ -14,12 +16,17 @@ class CustomTrainer(Trainer):
         num_tokenizer=None,
         order_numbers=None,
         loss_type: str = "mse",
+        cb_weight: float = 0.0,
+        cb_beta: float = 0.999,
+        cb_gamma: float = 2.0,
+        class_counts=None,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.ntl_weight = float(ntl_weight)
         self.emo_weight = float(emo_weight)
         self.emo_topk = int(emo_topk)
+        self.cb_weight = float(cb_weight)
 
         self.num_tokenizer = num_tokenizer
         self.order_numbers = order_numbers
@@ -37,6 +44,19 @@ class CustomTrainer(Trainer):
                 tokenizer=self.num_tokenizer, vocab_size=vocab_size,
                 device=device, loss_function=torch.nn.functional.mse_loss
             )
+
+        # Class-Balanced Focal Loss
+        if self.cb_weight > 0 and class_counts is not None:
+            self.cbfl_criterion = ClassBalancedFocalLoss(
+                tokenizer=self.num_tokenizer,
+                vocab_size=vocab_size,
+                class_counts=class_counts,
+                device=device,
+                beta=cb_beta,
+                gamma=cb_gamma,
+            )
+        else:
+            self.cbfl_criterion = None
 
         self._last_logged_step = -1
 
@@ -141,76 +161,94 @@ class CustomTrainer(Trainer):
         if logits is None:
             raise ValueError("Model outputs must include 'logits'.")
 
+        # Shifted logits/labels (shared by NTL and CBFL)
+        if not getattr(model.config, "is_encoder_decoder", False):
+            logits_shifted = logits[:, :-1, :]          # [B, T-1, V]
+            labels_shifted = ntl_labels[:, 1:]          # [B, T-1]
+        else:
+            logits_shifted, labels_shifted = logits, ntl_labels
+
         # 2) NTL
         if self.ntl_weight != 0:
-            if not getattr(model.config, "is_encoder_decoder", False):
-                # 🚫 .contiguous() 제거: 여기서도 수 GB 복사가 날 수 있음
-                logits_ntl = logits[:, :-1, :]          # [B, T-1, V]
-                labels_ntl = ntl_labels[:, 1:]          # [B, T-1]
-            else:
-                logits_ntl, labels_ntl = logits, ntl_labels
-
-            ntl_loss = self.ntl_criterion(logits_ntl, labels_ntl)
+            ntl_loss = self.ntl_criterion(logits_shifted, labels_shifted)
         else:
-            ntl_loss = logits.sum() * 0.0
+            ntl_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
 
         # 3) EMO
         if emo_labels is not None and self.emo_weight != 0:
             emo_loss = self._emo_loss_topk(logits, emo_labels, model)
         else:
-            emo_loss = logits.sum() * 0.0
+            emo_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+
+        # 4) CBFL (Class-Balanced Focal Loss)
+        #
+        # OOM 방지 전략:
+        #   Step A (checkpoint 밖): extract_digit_logits
+        #     - logits_shifted [B, T-1, V] → digit_logits [M, N_digit]
+        #     - gradient 경로는 유지, 하지만 checkpoint에는 저장 안 함
+        #   Step B (checkpoint 안): compute_focal_loss
+        #     - 입력: tiny [M, N_digit]  →  checkpoint 저장 크기 ≈ 0
+        #     - recompute 비용도 tiny
+        #
+        # OLD: checkpoint가 logits_shifted [B, T-1, V] ≈ 2.1 GB 저장
+        #      backward recompute 시 [B, T-1, V] + scatter grad [B, T-1, V] 동시 상주
+        # NEW: checkpoint가 digit_logits [M, N_digit] ≈ tiny 저장
+        #      scatter grad는 Step A backward 시점에서만 발생 (recompute와 겹치지 않음)
+        if self.cb_weight > 0 and self.cbfl_criterion is not None:
+            digit_logits, score_indices = self.cbfl_criterion.extract_digit_logits(
+                logits_shifted, labels_shifted
+            )
+            if digit_logits is not None:
+                cbfl_loss = torch.utils.checkpoint.checkpoint(
+                    self.cbfl_criterion.compute_focal_loss,
+                    digit_logits,
+                    score_indices,
+                    use_reentrant=False,
+                )
+            else:
+                cbfl_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        else:
+            cbfl_loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
 
         eps = 1e-8
 
-        # 4) 통합 로직 (원 로직 그대로)
-        if self.emo_weight < 0:
-            aux_loss = ntl_loss + emo_loss
+        # 5) 활성화된 aux loss를 모두 합산하여 dynamic scaling
+        #    aux = (ntl?) + (emo?) + (cbfl?)  →  total = 0.5*(CE + CE/aux * aux)
+        aux_parts = []
+        if self.ntl_weight != 0:
+            aux_parts.append(ntl_loss)
+        if self.emo_weight != 0:
+            aux_parts.append(emo_loss)
+        if self.cbfl_criterion is not None and self.cb_weight > 0:
+            aux_parts.append(cbfl_loss)
+
+        if aux_parts:
+            aux_loss = sum(aux_parts)
             with torch.no_grad():
                 aux_dynamic = base_loss.detach() / (aux_loss.detach() + eps)
             total_loss = 0.5 * (base_loss + aux_dynamic * aux_loss)
-
-            current_mode = "dynamic_aux"
             current_aux_weight = float(aux_dynamic.item())
-            current_ntl_weight = None
-            current_emo_weight = None
         else:
-            if self.ntl_weight < 0:
-                with torch.no_grad():
-                    ntl_dynamic = base_loss.detach() / (ntl_loss.detach() + eps)
-                total_loss = 0.5 * (base_loss + ntl_dynamic * ntl_loss)
-                current_ntl_weight = float(ntl_dynamic.item())
-            else:
-                total_loss = base_loss + self.ntl_weight * ntl_loss
-                current_ntl_weight = float(self.ntl_weight)
+            total_loss = base_loss
+            current_aux_weight = 0.0
 
-            total_loss = total_loss + self.emo_weight * emo_loss
-            current_mode = "static_emo"
-            current_aux_weight = None
-            current_emo_weight = float(self.emo_weight)
-
-        # 5) 로깅 (원 로직 그대로)
+        # 6) 로깅
         if self.model.training and self.state.global_step % self.args.logging_steps == 0:
             if self._last_logged_step != self.state.global_step:
-                log_dict = {
-                    "loss_ce": self._to_serializable(base_loss),
-                    "loss_ntl": self._to_serializable(ntl_loss),
-                    "loss_emo": self._to_serializable(emo_loss),
+                self.log({
+                    "loss_ce":    self._to_serializable(base_loss),
+                    "loss_ntl":   self._to_serializable(ntl_loss),
+                    "loss_emo":   self._to_serializable(emo_loss),
+                    "loss_cbfl":  self._to_serializable(cbfl_loss),
                     "loss_total": self._to_serializable(total_loss),
-                    "loss_mode": current_mode,
-                }
-                if current_aux_weight is not None:
-                    log_dict["aux_weight"] = float(current_aux_weight)
-                if current_ntl_weight is not None:
-                    log_dict["ntl_weight"] = float(current_ntl_weight)
-                if current_emo_weight is not None:
-                    log_dict["emo_weight"] = float(current_emo_weight)
-
-                self.log(log_dict)
+                    "aux_dynamic": current_aux_weight,
+                })
                 self._last_logged_step = self.state.global_step
 
         if isinstance(outputs, dict):
             outputs["ce_loss"] = base_loss.detach()
             outputs["ntl_loss"] = ntl_loss.detach()
             outputs["emo_loss"] = emo_loss.detach()
+            outputs["cbfl_loss"] = cbfl_loss.detach()
 
         return (total_loss, outputs) if return_outputs else total_loss
